@@ -1,0 +1,16 @@
+## .NET / Visual Studio
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+*.user
+.vs/
+
+## Rider / VS Code
+.idea/
+.vscode/
+
+## Build / test output
+[Tt]est[Rr]esults/
+*.trx
+artifacts/
