@@ -1,5 +1,7 @@
 # The `Resolve<T>` pattern
 
+[![CI](https://github.com/sovist/resolve-pattern/actions/workflows/ci.yml/badge.svg)](https://github.com/sovist/resolve-pattern/actions/workflows/ci.yml)
+
 ```
 A circular dependency was detected for the service of type 'IProjectService'.
 IProjectService(ProjectService) -> ITaskService(TaskService) -> IProjectService
