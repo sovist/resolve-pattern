@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ResolvePattern.Sample/ResolvePattern.Sample.csproj" />
+    <Project Path="src/ResolvePattern/ResolvePattern.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ResolvePattern.Tests/ResolvePattern.Tests.csproj" />
+  </Folder>
+</Solution>
