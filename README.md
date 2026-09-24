@@ -22,11 +22,11 @@ It is deliberately tiny (four files of infrastructure, no framework dependency b
 There's a pull request that shows up in every long-lived service. It adds one parameter to a constructor:
 
 ```csharp
-public TaskAppService(
-    ITaskRepository taskRepository,
-    ITaskManager taskManager,
-    IProjectManager projectManager,
-+   ITaskHistoryManager taskHistoryManager,
+public TaskBoardService(
+    ITaskStore taskStore,
+    ITaskPlanner taskPlanner,
+    IProjectCatalog projectCatalog,
++   ITaskAuditTrail taskAuditTrail,
     /* ... */)
 ```
 
@@ -87,10 +87,18 @@ public class ProjectService : ServiceBase, IProjectService
 What the one change in shape buys:
 
 - **No construction-time cycles.** The cycle resolves lazily at *use* time, exactly as it would if you'd newed the objects by hand.
-- **No pressure toward bloat.** Adding dep #30 is one property — identical cost and visibility to dep #3. No constructor to bloat means no false "ctor is getting long" signal everyone learns to ignore.
+- **No friction from bloat.** Adding dep #30 is one property — identical cost and visibility to dep #3. That cuts both ways; see [What it does not fix](#what-it-does-not-fix-bloat).
 - **Pay for what you use.** A request that touches 3 collaborators instantiates 3, not the 30 reachable in the graph.
 - **Uniform shape.** Every service looks the same in every module, written in any year. One pattern to learn.
 - **Refactor-safe tests** (see below).
+
+### What it does not fix: bloat
+
+Be clear about which half of the problem this solves. It removes the *pain* of a service with thirty collaborators — the constructor, the cycle workarounds, the page of mock setup. It does nothing about the service having thirty collaborators. The root cause named above — adding a dependency costs ~zero and keeps costing ~zero — is just as true here: the thirtieth property is one line, the same as the third.
+
+Years in, most services stay small — but a handful keep growing, and nothing stops them. A thirty-parameter constructor would have forced a conversation long before; thirty one-line properties grow without anyone noticing.
+
+So the constructor was a checkpoint everyone learned to ignore, and this pattern removes it rather than repairing it. If you adopt it, put a checkpoint back on purpose, one that cannot be tolerated into silence: count the collaborator properties per service in CI and fail above a threshold you choose, with an allow-list for the few services you have decided may be large. The pattern makes a large service cheap to *live with*; it must not make it free to *become*.
 
 ### Not for you if
 
@@ -110,10 +118,10 @@ Four small files, no magic:
 
 | File | Role |
 |---|---|
-| [`ResolverScope.cs`](src/ResolvePattern/ResolverScope.cs) | The ambient scope. Lives in `AsyncLocal`, wraps an `IServiceScope`. `Resolve<T>()` defers to the container's lifetimes; `ResolveLazy<T>()` **memoizes for the life of the scope**. Supports nesting. |
+| [`ResolverScope.cs`](src/ResolvePattern/ResolverScope.cs) | The ambient scope. Lives in `AsyncLocal`, wraps an `IServiceScope`. `Resolve<T>()` defers to the container's lifetimes; `ResolveLazy<T>()` **memoizes for the life of the scope**. Supports nesting. `RunDetached()` starts work with no ambient scope. |
 | [`ServiceBase.cs`](src/ResolvePattern/ServiceBase.cs) | Base class exposing `protected Resolve<T>()`, which is `Resolver.ResolveLazy<T>()` — cached for the scope. That default is the one policy the base class adds. |
 | [`Resolver.cs`](src/ResolvePattern/Resolver.cs) | `IResolver` — container-lifetime resolution — and `ILazyResolver`, which adds the memoizing `ResolveLazy<T>()`. `AmbientResolver` implements both by forwarding to the current scope. No static facade. |
-| [`ServiceProviderExtensions.cs`](src/ResolvePattern/ServiceProviderExtensions.cs) | `UseScope(out var resolver)` opens a scope and hands back its resolver, `EnsureUseScope()` opens one only if none is open, and `AddResolved<TService, TImpl>()` registers a service and wires it at construction. |
+| [`ServiceProviderExtensions.cs`](src/ResolvePattern/ServiceProviderExtensions.cs) | `UseScope(out var resolver)` opens a scope and hands back its resolver, `EnsureUseScope()` opens one only if none is open, `RunInOwnScope()` runs fire-and-forget work in a scope of its own, and `AddResolved<TService, TImpl>()` registers a service and wires it at construction. |
 
 `Resolve<T>()` requires a current scope, and every entry point opens one — worker, job, migration, test, and web request alike:
 
@@ -164,9 +172,50 @@ using (serviceProvider.EnsureUseScope())   // no-op if a scope is already open
 }
 ```
 
-### There is no static resolver
+### A service belongs to the flow, not to the scope that built it
 
-Nothing here reaches the container through a static. Entry points get their resolver from the scope they open; services get theirs assigned when the container constructs them:
+This is the rule the whole design turns on, and it is deliberate. A service's `Resolve<T>()` answers from whichever scope is ambient *at the moment of the call* — not from the scope that happened to construct it. The service object is a bundle of behaviour; the scope is the context it runs in.
+
+That is what makes the most common shape in a long-lived backend work — one singleton worker, many batches in parallel, a scope per lane:
+
+```csharp
+public class BatchWorker(IServiceProvider root) : ServiceBase, IBatchWorker     // registered as a singleton
+{
+    private IUnitOfWork UnitOfWork => Resolve<IUnitOfWork>();          // per scope: per lane
+
+    public Task RunAll(IEnumerable<int> batchIds) =>
+        Task.WhenAll(batchIds.Select(id => Task.Run(async () =>
+        {
+            using (root.UseScope())                                    // each lane opens its own
+            {
+                await RunBatch(id);                                    // same `this`, lane's own UnitOfWork
+            }
+        })));
+
+    private Task RunBatch(int batchId) => /* ... uses UnitOfWork ... */;
+}
+```
+
+Eight lanes, one worker object, eight units of work that never meet ([`ScopeFlowTests.cs`](tests/ResolvePattern.Tests/ScopeFlowTests.cs)). The alternative that looks cleaner on paper — assign each service the resolver of the scope that built it, and drop the ambient state — breaks exactly this: a singleton is built by the root scope, so every lane would resolve from *that one*, sharing a single unit of work and DbContext across threads. Scoped services re-home the same way: one constructed in a request and called inside a nested scope resolves from the nested scope, which is what a "do this in a fresh scope once the request is done" hook relies on.
+
+The price is the one every ambient context pays (`HttpContext.Current`, `Transaction.Current`): the scope is static state that flows with the execution context. It is visible in one place — the `AsyncLocal` in [`ResolverScope.cs`](src/ResolvePattern/ResolverScope.cs) — and the rest of this section is about paying that price carefully.
+
+### Fire-and-forget: `RunInOwnScope()`
+
+Because the scope flows with the execution context, work forked inside a scope inherits it — and if the work outlives the scope, its next resolution fails with `ObjectDisposedException` (by design, rather than handing back an already-disposed instance). Work that should run on its own gets its own:
+
+```csharp
+serviceProvider.RunInOwnScope(async resolver =>
+{
+    await resolver.Resolve<IMailer>().SendAsync(message);            // its own scope, ended when the work is
+});
+```
+
+It starts with the execution context suppressed, so the work inherits no scope, then opens one. Suppressing the flow drops every other `AsyncLocal` too — a current user, a correlation id, the culture — so restore what the work needs inside it. `ResolverScope.RunDetached()` is the primitive, for work that opens its scope itself.
+
+### Where the resolver comes from
+
+No service reaches the ambient scope through a static *API*: entry points get their resolver from the scope they open; services get theirs assigned when the container constructs them:
 
 ```csharp
 services.AddResolved<ITaskService, TaskService>();             // AddScoped, plus: wire the resolver at construction
@@ -218,7 +267,7 @@ This is the same property that survives domain refactors without production-side
 ## Run it
 
 ```bash
-dotnet test                                   # 6 tests: cycles, caching, fresh, scope errors, substitution
+dotnet test                                   # 30 tests: cycles, caching, lifetimes, scope flow and disposal, substitution, smoke
 dotnet run --project src/ResolvePattern.Sample
 # -> Apollo: Task 1 in project 'Apollo', Task 2 in project 'Apollo'
 ```
@@ -233,9 +282,9 @@ Short answer: yes — and the rule is being misapplied if you reach for it here.
 
 The canonical "service locator is an anti-pattern" argument was written for **libraries**: code consumed by strangers who can't see your DI setup. Hiding a library's dependencies behind a locator genuinely harms its consumer, who has no way to learn what's needed except by running it and watching it throw. That advice is correct, and you should follow it in a library.
 
-Inside a **cohesive internal application** where every service inherits one base class and one team owns the whole graph, the premise inverts. There are no strangers. `Resolve<ITaskManager>()` on a base class is no more a "hidden dependency" than `this.HttpContext` on an MVC controller or an `@Autowired` field on a Spring bean — it's an ambient framework contract you opted into. **The pattern *is* the contract.**
+Inside a **cohesive internal application** where every service inherits one base class and one team owns the whole graph, the premise inverts. There are no strangers. `Resolve<ITaskPlanner>()` on a base class is no more a "hidden dependency" than `this.HttpContext` on an MVC controller or an `@Autowired` field on a Spring bean — it's an ambient framework contract you opted into. **The pattern *is* the contract.**
 
-It is also not reached statically. `IResolver` is an ordinary injectable interface: entry points receive one from the scope they open, services are assigned one at registration, and any class that wants the dependency visible in its signature can take it as a constructor parameter. That does not make it stop being a locator — it makes it a locator you can substitute, and one that no longer hides behind a global.
+It is also not called statically. `IResolver` is an ordinary injectable interface: entry points receive one from the scope they open, services are assigned one at registration, and any class that wants the dependency visible in its signature can take it as a constructor parameter. Underneath, though, the scope it forwards to *is* ambient static state — an `AsyncLocal`, like `Transaction.Current` — and that is not an accident to apologise for: it is what lets one singleton serve many concurrent scopes (see [A service belongs to the flow](#a-service-belongs-to-the-flow-not-to-the-scope-that-built-it)). None of this makes it stop being a locator. It makes it a locator you can substitute, with its one piece of global state in one visible place.
 
 There's a precedent, and it cuts both ways. The Java enterprise world hit this decay curve ~15 years earlier under the same domain pressures, and a large share of Spring code answered it with `@Autowired` on fields — collaborators found by the framework, no constructor. The Spring team's own guidance says the opposite: prefer constructor injection, treat field injection as a smell. Both facts are true, and the disagreement is this README's argument in miniature. The practice drifted toward ambient resolution because the pressure is real; the guidance resists it because, without a team holding the line, it degrades into hidden dependencies nobody owns. That is why the uniformity condition in [When **not** to use this](#when-not-to-use-this) is not optional.
 
@@ -248,9 +297,9 @@ This is a narrow tool. Outside these conditions, use constructor injection.
 - **Don't do this in a library.** If consumers can't see your container, the original anti-pattern rule applies at full force. Make dependencies explicit. The whole argument is conditioned on "cohesive internal product."
 - **Don't do this without a shared base class and a team that holds the line.** The safety comes from *uniformity*: every service the same way, a bare `Resolver.Resolve<T>()` inside one a flagged exception. A codebase that's 60% ctor injection, 20% property resolution, 10% `IServiceProvider.GetService()` is worse than any of those applied consistently. If your team won't commit everywhere, pick something else and apply *it* everywhere.
 - **Don't do this if your domain is genuinely a tree and your services are small.** Three years in with 5-param constructors and no cycles? You may never hit the decay curve hard enough to justify swimming against the ecosystem's defaults. Being unconventional has real costs — onboarding, tooling, this very conversation forever.
-- **Know the trade-offs even when it's right.** You give up compile-time "this dependency is missing" errors for a failure at first use. The mitigation is mechanical, because every collaborator is a property on a `ServiceBase`: a smoke test opens a scope, resolves every registration and reads every property, so a missing registration fails in CI rather than in production ([`RegistrationSmokeTests.cs`](tests/ResolvePattern.Tests/RegistrationSmokeTests.cs)). You take on an ambient scope that must be opened at every non-request entry point; forgetting is a runtime error (with a clear message), not a compile error. Manageable, not free.
+- **Know the trade-offs even when it's right.** You give up compile-time "this dependency is missing" errors for a failure at first use. The mitigation is mechanical, because every collaborator is a property on a `ServiceBase`: a smoke test opens a scope, resolves every registration and reads every property, so a missing registration fails in CI rather than in production ([`RegistrationSmokeTests.cs`](tests/ResolvePattern.Tests/RegistrationSmokeTests.cs)). You take on an ambient scope that must be opened at every non-request entry point; forgetting is a runtime error (with a clear message), not a compile error. And because the scope flows with the execution context, fire-and-forget work must be started with `RunInOwnScope()`, or it inherits a scope it will outlive. Finally, you lose the constructor as a size signal without gaining a replacement — add one yourself ([What it does not fix](#what-it-does-not-fix-bloat)). Manageable, not free.
 
-The real lesson generalizes past DI: **the cheapest decision and the correct decision are not the same, and the gap is invisible at the moment you choose.** "Add one more constructor parameter" wins every PR review and loses the decade.
+The real lesson generalizes past DI: **the cheapest decision and the correct decision are not the same, and the gap is invisible at the moment you choose.** "Add one more constructor parameter" wins every PR review and loses the decade. So does "add one more property" — which is why this pattern needs a checkpoint of its own.
 
 ---
 
