@@ -86,4 +86,43 @@ public class ScopeDisposalTests : TestBase
 
         ResolverScope.Current.ShouldBeNull();
     }
+
+    [Fact]
+    public void Dispose_ShouldKeepTheInnerScopeCurrent_When_TheOuterScopeIsDisposedFirst()
+    {
+        using var provider = BuildProvider();
+
+        var outer = ResolverScope.Begin(provider);
+        var inner = ResolverScope.Begin(provider);
+
+        outer.Dispose();
+
+        ResolverScope.Current.ShouldBeSameAs(inner);
+
+        inner.Resolve<ITaskService>().ShouldNotBeNull();
+
+        inner.Dispose();
+
+        // Not revived: the dead outer scope is skipped on the way back.
+        ResolverScope.Current.ShouldBeNull();
+    }
+
+    [Fact]
+    public void Dispose_ShouldRestoreTheNearestLiveScope_When_AMiddleScopeIsDisposedFirst()
+    {
+        using var provider = BuildProvider();
+
+        var outer = ResolverScope.Begin(provider);
+        var middle = ResolverScope.Begin(provider);
+        var inner = ResolverScope.Begin(provider);
+
+        middle.Dispose();
+        inner.Dispose();
+
+        ResolverScope.Current.ShouldBeSameAs(outer);
+
+        outer.Dispose();
+
+        ResolverScope.Current.ShouldBeNull();
+    }
 }

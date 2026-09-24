@@ -104,6 +104,25 @@ public static class ServiceProviderExtensions
         return provider.EnsureUseScope(out _);
     }
 
+    /// <summary>
+    /// Runs <paramref name="work"/> detached from the caller's scope, in a scope of its own that ends
+    /// when the work does — for fire-and-forget work that must not share, or outlive, the caller's scope.
+    /// See <see cref="ResolverScope.RunDetached"/>.
+    /// </summary>
+    public static Task RunInOwnScope(this IServiceProvider provider, Func<IResolver, Task> work)
+    {
+        // Captured now: the caller's scope may have ended by the time the work starts.
+        var scopeFactory = provider.GetRequiredService<IServiceScopeFactory>();
+
+        return ResolverScope.RunDetached(async () =>
+        {
+            using (var scope = ResolverScope.Begin(scopeFactory))
+            {
+                await work(scope);
+            }
+        });
+    }
+
     private sealed class NoOpDisposable : IDisposable
     {
         public static NoOpDisposable Instance { get; } = new();

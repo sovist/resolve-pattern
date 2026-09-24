@@ -39,6 +39,11 @@ public sealed class ResolverScope : ILazyResolver, IDisposable
         return new ResolverScope(provider.CreateScope());
     }
 
+    public static ResolverScope Begin(IServiceScopeFactory scopeFactory)
+    {
+        return new ResolverScope(scopeFactory.CreateScope());
+    }
+
     /// <summary>
     /// Resolves with the service's registered lifetime.
     /// </summary>
@@ -78,9 +83,46 @@ public sealed class ResolverScope : ILazyResolver, IDisposable
 
         _cache.Clear();
 
-        CurrentScope.Value = _previous;
+        // Only the current scope restores. Disposed out of order, an outer scope leaves the inner one
+        // current, and the inner one later skips past the dead outer one instead of reviving it.
+        if (CurrentScope.Value == this)
+        {
+            CurrentScope.Value = NearestLive(_previous);
+        }
 
         _scope.Dispose();
+
+        return;
+
+        ResolverScope? NearestLive(ResolverScope? scope)
+        {
+            while (scope is { _disposed: true })
+            {
+                scope = scope._previous;
+            }
+
+            return scope;
+        }
+    }
+
+    /// <summary>
+    /// Starts <paramref name="work"/> with no ambient scope — the execution context does not flow into it.
+    ///
+    /// For fire-and-forget work started inside a scope: forked the ordinary way it would capture that
+    /// scope and outlive it. Detached, it has none, and must open its own. Everything else carried by
+    /// the execution context stays behind too: every other <see cref="AsyncLocal{T}"/>, culture included.
+    /// </summary>
+    public static Task RunDetached(Func<Task> work)
+    {
+        if (ExecutionContext.IsFlowSuppressed())
+        {
+            return Task.Run(work);
+        }
+
+        using (ExecutionContext.SuppressFlow())
+        {
+            return Task.Run(work);
+        }
     }
 
     private void ThrowIfDisposed()
